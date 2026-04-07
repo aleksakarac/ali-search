@@ -191,6 +191,12 @@ def format_details(p: dict) -> str:
     lines.append(f"ID:      {p.get('id', p.get('product_id', '?'))}")
     lines.append(f"Currency: {p.get('currency', 'USD')}")
 
+    # Deal type
+    if p.get("has_welcome_deal"):
+        lines.append(f"Deal:    WELCOME DEAL (promo/bundle pricing, may require new buyer account)")
+    else:
+        lines.append(f"Deal:    Normal listing")
+
     # SKU pricing summary
     skus = p.get("sku_pricing", [])
     if skus:
@@ -227,7 +233,10 @@ def format_details(p: dict) -> str:
             lines.append(f"Package: {', '.join(dims)}")
 
     # Seller
-    if p.get("seller_name") or p.get("store_name"):
+    seller = p.get("seller", {})
+    if isinstance(seller, dict) and seller:
+        lines.append(f"\nSeller:  {seller.get('name', '?')} (ID: {seller.get('id', '?')})")
+    elif p.get("seller_name") or p.get("store_name"):
         lines.append(f"\nSeller:  {p.get('seller_name', p.get('store_name', '?'))}")
     if p.get("store_url"):
         lines.append(f"Store:   {p['store_url']}")
@@ -304,15 +313,32 @@ def format_comparison(products: list[dict]) -> str:
     if not products:
         return "No products to compare."
 
+    def _price_range(p):
+        skus = p.get("sku_pricing", [])
+        if skus:
+            prices = [s["sale_price"] for s in skus if s.get("sale_price")]
+            if prices:
+                lo, hi = min(prices), max(prices)
+                return f"${lo:.2f} - ${hi:.2f}" if lo != hi else f"${lo:.2f}"
+        return f"{p.get('price', p.get('sale_price', '?'))} {p.get('currency', 'USD')}"
+
+    def _seller(p):
+        s = p.get("seller", {})
+        if isinstance(s, dict) and s.get("name"):
+            return s["name"]
+        return p.get("seller_name", p.get("store_name", "?"))
+
     fields = [
         ("Title", lambda p: p.get("title", p.get("name", "?"))[:50]),
         ("ID", lambda p: str(p.get("id", p.get("product_id", "?")))),
-        ("Price", lambda p: f"{p.get('price', p.get('sale_price', '?'))} {p.get('currency', 'USD')}"),
+        ("Price", _price_range),
         ("Original", lambda p: str(p.get("original_price", "-"))),
         ("Discount", lambda p: str(p.get("discount", "-"))),
         ("Rating", lambda p: str(p.get("rating", p.get("average_rating", "?")))),
         ("Orders", lambda p: str(p.get("orders_count", p.get("orders", "?")))),
         ("Feedback", lambda p: f"{p.get('positive_feedback_rate', '?')}%"),
+        ("Deal type", lambda p: "WELCOME DEAL" if p.get("has_welcome_deal") else "Normal"),
+        ("Seller", _seller),
     ]
 
     headers = ["Field"] + [f"Product {i+1}" for i in range(len(products))]
