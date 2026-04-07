@@ -1,0 +1,377 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["requests", "tabulate"]
+# ///
+"""
+ali - AliExpress product search and comparison CLI
+
+Uses the Omkar.cloud AliExpress Scraper API (5,000 free requests/month).
+Set your API key: export ALIEXPRESS_API_KEY="your-key"
+Or save it to: ~/.config/ali/api_key
+
+Sign up at: https://www.omkar.cloud/auth/sign-up?redirect=/api-key
+
+Usage:
+  ali search "ESP32 board" --pages 3 --sort price
+  ali search "18650 battery" --max-price 5 --min-rating 4.5 --min-orders 100
+  ali details 1005007170995524
+  ali compare 1005007170995524 1005006789012345
+
+Machine-readable output (for other Claude Code instances):
+  ali search "relay module" --json
+  ali details 1005007170995524 --json
+"""
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+import requests
+from tabulate import tabulate
+
+API_BASE = "https://aliexpress-scraper-api.omkar.cloud"
+CONFIG_DIR = Path.home() / ".config" / "ali"
+KEY_FILE = CONFIG_DIR / "api_key"
+
+
+def get_api_key() -> str:
+    key = os.environ.get("ALIEXPRESS_API_KEY", "").strip()
+    if key:
+        return key
+    if KEY_FILE.exists():
+        key = KEY_FILE.read_text().strip()
+        if key:
+            return key
+    print(
+        "Error: No API key found.\n"
+        "  export ALIEXPRESS_API_KEY='your-key'\n"
+        "  or save it to ~/.config/ali/api_key\n\n"
+        "Get a free key (5,000 req/month): https://www.omkar.cloud/auth/sign-up?redirect=/api-key",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
+def api_get(endpoint: str, params: dict) -> dict:
+    key = get_api_key()
+    try:
+        resp = requests.get(
+            f"{API_BASE}{endpoint}",
+            params=params,
+            headers={"API-Key": key},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except requests.exceptions.HTTPError as e:
+        if resp.status_code == 401:
+            print("Error: Invalid API key or unauthorized.", file=sys.stderr)
+        elif resp.status_code == 429:
+            print("Error: Rate limit exceeded. Free tier: 5,000 req/month.", file=sys.stderr)
+        else:
+            print(f"Error: HTTP {resp.status_code}: {e}", file=sys.stderr)
+        sys.exit(1)
+    except requests.exceptions.RequestException as e:
+        print(f"Error: Request failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def search_products(query: str, pages: int = 1) -> list[dict]:
+    all_products = []
+    for page in range(1, pages + 1):
+        if pages > 1:
+            print(f"Fetching page {page}/{pages}...", file=sys.stderr)
+        data = api_get("/aliexpress/search", {"query": query, "page": page})
+        products = data if isinstance(data, list) else data.get("products", data.get("data", []))
+        if not products:
+            break
+        all_products.extend(products)
+    return all_products
+
+
+def get_product_details(product_id: str) -> dict:
+    data = api_get("/aliexpress/product", {"id": product_id})
+    return data
+
+
+def filter_products(
+    products: list[dict],
+    max_price: float | None = None,
+    min_rating: float | None = None,
+    min_orders: int | None = None,
+) -> list[dict]:
+    filtered = []
+    for p in products:
+        price = parse_float(p.get("price", p.get("sale_price", "0")))
+        rating = parse_float(p.get("rating", p.get("average_rating", "0")))
+        orders = parse_int(p.get("orders_count", p.get("orders", "0")))
+
+        if max_price is not None and price > max_price:
+            continue
+        if min_rating is not None and rating < min_rating:
+            continue
+        if min_orders is not None and orders < min_orders:
+            continue
+        filtered.append(p)
+    return filtered
+
+
+def sort_products(products: list[dict], sort_by: str) -> list[dict]:
+    key_map = {
+        "price": lambda p: parse_float(p.get("price", p.get("sale_price", "999999"))),
+        "rating": lambda p: -parse_float(p.get("rating", p.get("average_rating", "0"))),
+        "orders": lambda p: -parse_int(p.get("orders_count", p.get("orders", "0"))),
+        "discount": lambda p: -parse_float(p.get("discount", "0").replace("%", "")),
+    }
+    if sort_by in key_map:
+        return sorted(products, key=key_map[sort_by])
+    return products
+
+
+def parse_float(val) -> float:
+    if isinstance(val, (int, float)):
+        return float(val)
+    try:
+        return float(str(val).replace(",", "").replace("%", "").replace("$", "").strip())
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def parse_int(val) -> int:
+    if isinstance(val, int):
+        return val
+    try:
+        return int(float(str(val).replace(",", "").replace("+", "").strip()))
+    except (ValueError, TypeError):
+        return 0
+
+
+def format_table(products: list[dict]) -> str:
+    rows = []
+    for i, p in enumerate(products, 1):
+        pid = p.get("id", p.get("product_id", "?"))
+        title = p.get("title", p.get("name", "?"))
+        if len(title) > 60:
+            title = title[:57] + "..."
+        price = p.get("price", p.get("sale_price", "?"))
+        orig = p.get("original_price", p.get("original_price", ""))
+        currency = p.get("currency", "USD")
+        discount = p.get("discount", "")
+        rating = p.get("rating", p.get("average_rating", "?"))
+        orders = p.get("orders_count", p.get("orders", "?"))
+        feedback = p.get("positive_feedback_rate", "")
+
+        price_str = f"{price} {currency}"
+        if orig and str(orig) != str(price):
+            price_str += f" (was {orig})"
+        if discount:
+            price_str += f" -{discount}" if "%" in str(discount) else f" -{discount}%"
+
+        rows.append([i, pid, title, price_str, rating, orders, feedback])
+
+    return tabulate(
+        rows,
+        headers=["#", "ID", "Title", "Price", "Rating", "Orders", "Feedback"],
+        tablefmt="simple",
+        numalign="right",
+    )
+
+
+def format_details(p: dict) -> str:
+    lines = []
+    lines.append(f"Product: {p.get('title', p.get('name', '?'))}")
+    lines.append(f"ID:      {p.get('id', p.get('product_id', '?'))}")
+    lines.append(f"Price:   {p.get('price', p.get('sale_price', '?'))} {p.get('currency', 'USD')}")
+    if p.get("original_price"):
+        lines.append(f"Was:     {p['original_price']} {p.get('currency', 'USD')}")
+    if p.get("discount"):
+        lines.append(f"Discount: {p['discount']}")
+    lines.append(f"Rating:  {p.get('rating', p.get('average_rating', '?'))}")
+    lines.append(f"Orders:  {p.get('orders_count', p.get('orders', '?'))}")
+    if p.get("positive_feedback_rate"):
+        lines.append(f"Feedback: {p['positive_feedback_rate']}%")
+
+    if p.get("seller_name") or p.get("store_name"):
+        lines.append(f"\nSeller:  {p.get('seller_name', p.get('store_name', '?'))}")
+    if p.get("store_url"):
+        lines.append(f"Store:   {p['store_url']}")
+
+    if p.get("description"):
+        lines.append(f"\nDescription:\n{p['description'][:500]}")
+
+    if p.get("specifications") or p.get("specs"):
+        specs = p.get("specifications", p.get("specs", []))
+        if specs:
+            lines.append("\nSpecifications:")
+            if isinstance(specs, list):
+                for s in specs:
+                    if isinstance(s, dict):
+                        lines.append(f"  {s.get('name', '?')}: {s.get('value', '?')}")
+                    else:
+                        lines.append(f"  {s}")
+            elif isinstance(specs, dict):
+                for k, v in specs.items():
+                    lines.append(f"  {k}: {v}")
+
+    if p.get("variants") or p.get("skus"):
+        variants = p.get("variants", p.get("skus", []))
+        if variants and isinstance(variants, list):
+            lines.append(f"\nVariants ({len(variants)}):")
+            for v in variants[:20]:
+                if isinstance(v, dict):
+                    name = v.get("name", v.get("sku_attr", "?"))
+                    vprice = v.get("price", v.get("sku_price", "?"))
+                    stock = v.get("stock", v.get("quantity", ""))
+                    stock_str = f" (stock: {stock})" if stock else ""
+                    lines.append(f"  - {name}: {vprice}{stock_str}")
+
+    if p.get("images"):
+        lines.append(f"\nImages: {len(p['images'])} available")
+        for img in p["images"][:5]:
+            lines.append(f"  {img}")
+
+    url = p.get("url", p.get("product_url", ""))
+    if not url:
+        pid = p.get("id", p.get("product_id", ""))
+        if pid:
+            url = f"https://www.aliexpress.com/item/{pid}.html"
+    if url:
+        lines.append(f"\nURL: {url}")
+
+    return "\n".join(lines)
+
+
+def format_comparison(products: list[dict]) -> str:
+    if not products:
+        return "No products to compare."
+
+    fields = [
+        ("Title", lambda p: p.get("title", p.get("name", "?"))[:50]),
+        ("ID", lambda p: str(p.get("id", p.get("product_id", "?")))),
+        ("Price", lambda p: f"{p.get('price', p.get('sale_price', '?'))} {p.get('currency', 'USD')}"),
+        ("Original", lambda p: str(p.get("original_price", "-"))),
+        ("Discount", lambda p: str(p.get("discount", "-"))),
+        ("Rating", lambda p: str(p.get("rating", p.get("average_rating", "?")))),
+        ("Orders", lambda p: str(p.get("orders_count", p.get("orders", "?")))),
+        ("Feedback", lambda p: f"{p.get('positive_feedback_rate', '?')}%"),
+    ]
+
+    headers = ["Field"] + [f"Product {i+1}" for i in range(len(products))]
+    rows = []
+    for name, fn in fields:
+        row = [name] + [fn(p) for p in products]
+        rows.append(row)
+
+    return tabulate(rows, headers=headers, tablefmt="simple")
+
+
+def cmd_search(args):
+    products = search_products(args.query, pages=args.pages)
+
+    if not products:
+        print("No results found.", file=sys.stderr)
+        sys.exit(0)
+
+    products = filter_products(
+        products,
+        max_price=args.max_price,
+        min_rating=args.min_rating,
+        min_orders=args.min_orders,
+    )
+
+    if not products:
+        print("No results match your filters.", file=sys.stderr)
+        sys.exit(0)
+
+    products = sort_products(products, args.sort)
+
+    if args.limit:
+        products = products[: args.limit]
+
+    if args.json:
+        json.dump(products, sys.stdout, indent=2, ensure_ascii=False)
+        print()
+    else:
+        print(f"\nFound {len(products)} products for \"{args.query}\"")
+        print(f"Sorted by: {args.sort}\n")
+        print(format_table(products))
+        print(f"\nUse 'ali details <ID>' for full product info")
+        print(f"Use 'ali compare <ID1> <ID2> ...' to compare products")
+
+
+def cmd_details(args):
+    data = get_product_details(args.product_id)
+
+    if args.json:
+        json.dump(data, sys.stdout, indent=2, ensure_ascii=False)
+        print()
+    else:
+        print(format_details(data))
+
+
+def cmd_compare(args):
+    products = []
+    for pid in args.product_ids:
+        print(f"Fetching {pid}...", file=sys.stderr)
+        data = get_product_details(pid)
+        products.append(data)
+
+    if args.json:
+        json.dump(products, sys.stdout, indent=2, ensure_ascii=False)
+        print()
+    else:
+        print(format_comparison(products))
+
+
+def cmd_save_key(args):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    KEY_FILE.write_text(args.key.strip())
+    KEY_FILE.chmod(0o600)
+    print(f"API key saved to {KEY_FILE}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="ali",
+        description="Search and compare AliExpress products via CLI",
+        epilog="Get API key: https://www.omkar.cloud/auth/sign-up?redirect=/api-key",
+    )
+    parser.add_argument("--json", action="store_true", help="Output as JSON (machine-readable)")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # search
+    sp = sub.add_parser("search", aliases=["s"], help="Search products by keyword")
+    sp.add_argument("query", help="Search query (e.g. 'ESP32 board')")
+    sp.add_argument("--pages", type=int, default=1, help="Number of pages to fetch (default: 1)")
+    sp.add_argument("--sort", choices=["price", "rating", "orders", "discount"], default="orders", help="Sort results (default: orders)")
+    sp.add_argument("--max-price", type=float, help="Maximum price filter")
+    sp.add_argument("--min-rating", type=float, help="Minimum rating filter (e.g. 4.5)")
+    sp.add_argument("--min-orders", type=int, help="Minimum order count filter")
+    sp.add_argument("--limit", type=int, help="Limit number of results shown")
+    sp.set_defaults(func=cmd_search)
+
+    # details
+    sp = sub.add_parser("details", aliases=["d"], help="Get full product details")
+    sp.add_argument("product_id", help="AliExpress product ID")
+    sp.set_defaults(func=cmd_details)
+
+    # compare
+    sp = sub.add_parser("compare", aliases=["c"], help="Compare products side by side")
+    sp.add_argument("product_ids", nargs="+", help="Product IDs to compare")
+    sp.set_defaults(func=cmd_compare)
+
+    # save-key
+    sp = sub.add_parser("save-key", help="Save API key to ~/.config/ali/api_key")
+    sp.add_argument("key", help="Your Omkar.cloud API key")
+    sp.set_defaults(func=cmd_save_key)
+
+    args = parser.parse_args()
+    args.json = getattr(args, "json", False) or args.json
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
