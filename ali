@@ -85,7 +85,12 @@ def search_products(query: str, pages: int = 1) -> list[dict]:
         if pages > 1:
             print(f"Fetching page {page}/{pages}...", file=sys.stderr)
         data = api_get("/aliexpress/search", {"query": query, "page": page})
-        products = data if isinstance(data, list) else data.get("products", data.get("data", []))
+        if isinstance(data, list):
+            products = data
+        elif isinstance(data, dict):
+            products = data.get("results", data.get("products", data.get("data", [])))
+        else:
+            products = []
         if not products:
             break
         all_products.extend(products)
@@ -93,7 +98,7 @@ def search_products(query: str, pages: int = 1) -> list[dict]:
 
 
 def get_product_details(product_id: str) -> dict:
-    data = api_get("/aliexpress/product", {"id": product_id})
+    data = api_get("/aliexpress/product", {"product_id": product_id})
     return data
 
 
@@ -184,56 +189,107 @@ def format_details(p: dict) -> str:
     lines = []
     lines.append(f"Product: {p.get('title', p.get('name', '?'))}")
     lines.append(f"ID:      {p.get('id', p.get('product_id', '?'))}")
-    lines.append(f"Price:   {p.get('price', p.get('sale_price', '?'))} {p.get('currency', 'USD')}")
-    if p.get("original_price"):
-        lines.append(f"Was:     {p['original_price']} {p.get('currency', 'USD')}")
-    if p.get("discount"):
-        lines.append(f"Discount: {p['discount']}")
-    lines.append(f"Rating:  {p.get('rating', p.get('average_rating', '?'))}")
-    lines.append(f"Orders:  {p.get('orders_count', p.get('orders', '?'))}")
+    lines.append(f"Currency: {p.get('currency', 'USD')}")
+
+    # SKU pricing summary
+    skus = p.get("sku_pricing", [])
+    if skus:
+        prices = [s["sale_price"] for s in skus if s.get("sale_price")]
+        if prices:
+            lo, hi = min(prices), max(prices)
+            if lo == hi:
+                lines.append(f"Price:   ${lo:.2f}")
+            else:
+                lines.append(f"Price:   ${lo:.2f} - ${hi:.2f}")
+        list_prices = [s["list_price"] for s in skus if s.get("list_price")]
+        if list_prices:
+            lines.append(f"List:    ${min(list_prices):.2f} - ${max(list_prices):.2f}")
+        discounts = [s.get("discount_label", "") for s in skus if s.get("discount_label")]
+        if discounts:
+            lines.append(f"Discount: {discounts[0]}")
+
+    if p.get("rating"):
+        lines.append(f"Rating:  {p['rating']}")
+    if p.get("orders_count"):
+        lines.append(f"Orders:  {p['orders_count']}")
     if p.get("positive_feedback_rate"):
         lines.append(f"Feedback: {p['positive_feedback_rate']}%")
 
+    # Package
+    pkg = p.get("package", {})
+    if pkg:
+        dims = []
+        if pkg.get("length_cm"):
+            dims.append(f"{pkg['length_cm']}x{pkg.get('width_cm', '?')}x{pkg.get('height_cm', '?')} cm")
+        if pkg.get("weight_kg"):
+            dims.append(f"{pkg['weight_kg']} kg")
+        if dims:
+            lines.append(f"Package: {', '.join(dims)}")
+
+    # Seller
     if p.get("seller_name") or p.get("store_name"):
         lines.append(f"\nSeller:  {p.get('seller_name', p.get('store_name', '?'))}")
     if p.get("store_url"):
         lines.append(f"Store:   {p['store_url']}")
 
-    if p.get("description"):
-        lines.append(f"\nDescription:\n{p['description'][:500]}")
+    # Variants
+    variants = p.get("variants", [])
+    if variants and isinstance(variants, list):
+        for vgroup in variants:
+            attr = vgroup.get("attribute_name", "Option")
+            options = vgroup.get("options", [])
+            if options:
+                lines.append(f"\n{attr} ({len(options)} options):")
+                for opt in options:
+                    lines.append(f"  - {opt.get('name', '?')}")
 
-    if p.get("specifications") or p.get("specs"):
-        specs = p.get("specifications", p.get("specs", []))
-        if specs:
-            lines.append("\nSpecifications:")
-            if isinstance(specs, list):
-                for s in specs:
-                    if isinstance(s, dict):
-                        lines.append(f"  {s.get('name', '?')}: {s.get('value', '?')}")
-                    else:
-                        lines.append(f"  {s}")
-            elif isinstance(specs, dict):
-                for k, v in specs.items():
-                    lines.append(f"  {k}: {v}")
+    # SKU pricing table
+    if skus:
+        lines.append(f"\nPricing ({len(skus)} SKUs):")
+        # Build variant ID -> name lookup
+        id_to_name = {}
+        for vgroup in variants:
+            for opt in vgroup.get("options", []):
+                id_to_name[str(opt.get("value_id", ""))] = opt.get("name", "?")
 
-    if p.get("variants") or p.get("skus"):
-        variants = p.get("variants", p.get("skus", []))
-        if variants and isinstance(variants, list):
-            lines.append(f"\nVariants ({len(variants)}):")
-            for v in variants[:20]:
-                if isinstance(v, dict):
-                    name = v.get("name", v.get("sku_attr", "?"))
-                    vprice = v.get("price", v.get("sku_price", "?"))
-                    stock = v.get("stock", v.get("quantity", ""))
-                    stock_str = f" (stock: {stock})" if stock else ""
-                    lines.append(f"  - {name}: {vprice}{stock_str}")
+        for s in skus:
+            vid = str(s.get("variant_ids", ""))
+            name = id_to_name.get(vid, vid)
+            sale = s.get("sale_price", "?")
+            lst = s.get("list_price", "")
+            qty = s.get("available_quantity", "")
+            discount = s.get("discount_label", "")
+            parts = [f"${sale}"]
+            if lst and str(lst) != str(sale):
+                parts.append(f"was ${lst}")
+            if discount:
+                parts.append(discount)
+            if qty:
+                parts.append(f"stock: {qty}")
+            lines.append(f"  {name}: {' | '.join(parts)}")
 
+    # Specifications
+    specs = p.get("specifications", p.get("specs", []))
+    if specs:
+        lines.append("\nSpecifications:")
+        if isinstance(specs, list):
+            for s in specs:
+                if isinstance(s, dict):
+                    lines.append(f"  {s.get('name', '?')}: {s.get('value', '?')}")
+                else:
+                    lines.append(f"  {s}")
+        elif isinstance(specs, dict):
+            for k, v in specs.items():
+                lines.append(f"  {k}: {v}")
+
+    # Images
     if p.get("images"):
-        lines.append(f"\nImages: {len(p['images'])} available")
+        lines.append(f"\nImages ({len(p['images'])}):")
         for img in p["images"][:5]:
             lines.append(f"  {img}")
 
-    url = p.get("url", p.get("product_url", ""))
+    # URL
+    url = p.get("listing_url", p.get("url", p.get("product_url", "")))
     if not url:
         pid = p.get("id", p.get("product_id", ""))
         if pid:
@@ -339,7 +395,6 @@ def main():
         description="Search and compare AliExpress products via CLI",
         epilog="Get API key: https://www.omkar.cloud/auth/sign-up?redirect=/api-key",
     )
-    parser.add_argument("--json", action="store_true", help="Output as JSON (machine-readable)")
     sub = parser.add_subparsers(dest="command", required=True)
 
     # search
@@ -351,16 +406,19 @@ def main():
     sp.add_argument("--min-rating", type=float, help="Minimum rating filter (e.g. 4.5)")
     sp.add_argument("--min-orders", type=int, help="Minimum order count filter")
     sp.add_argument("--limit", type=int, help="Limit number of results shown")
+    sp.add_argument("--json", action="store_true", help="Output as JSON (machine-readable)")
     sp.set_defaults(func=cmd_search)
 
     # details
     sp = sub.add_parser("details", aliases=["d"], help="Get full product details")
     sp.add_argument("product_id", help="AliExpress product ID")
+    sp.add_argument("--json", action="store_true", help="Output as JSON (machine-readable)")
     sp.set_defaults(func=cmd_details)
 
     # compare
     sp = sub.add_parser("compare", aliases=["c"], help="Compare products side by side")
     sp.add_argument("product_ids", nargs="+", help="Product IDs to compare")
+    sp.add_argument("--json", action="store_true", help="Output as JSON (machine-readable)")
     sp.set_defaults(func=cmd_compare)
 
     # save-key
@@ -369,7 +427,6 @@ def main():
     sp.set_defaults(func=cmd_save_key)
 
     args = parser.parse_args()
-    args.json = getattr(args, "json", False) or args.json
     args.func(args)
 
 
