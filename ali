@@ -175,11 +175,12 @@ def format_table(products: list[dict]) -> str:
         if discount:
             price_str += f" -{discount}" if "%" in str(discount) else f" -{discount}%"
 
-        rows.append([i, pid, title, price_str, rating, orders, feedback])
+        url = f"https://www.aliexpress.com/item/{pid}.html"
+        rows.append([i, title, price_str, rating, orders, url])
 
     return tabulate(
         rows,
-        headers=["#", "ID", "Title", "Price", "Rating", "Orders", "Feedback"],
+        headers=["#", "Title", "Price", "Rating", "Orders", "URL"],
         tablefmt="simple",
         numalign="right",
     )
